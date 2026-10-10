@@ -37,6 +37,26 @@ Login uses Snapie's web login page in the system browser plus PKCE. The app neve
 `GET /api/me` (Bearer) -> `{"user", "name", "admin"}`. Show `name` in the UI so users can see who they
 are signed in as. There is no email available; do not ask Snapie for one.
 
+## 2b. Sign in with Apple (iOS, native)
+Skips the browser. Same PKCE steps 1 to 3 from section 2 (you still call /api/auth/start and keep
+`state` and `verifier`; ignore the returned `url`), then:
+1. Run `ASAuthorizationAppleIDProvider` with scopes fullName and email, and set
+   `request.nonce = lowercase_hex(SHA256(state))` (the state string from /api/auth/start, hashed as
+   UTF-8, 64 hex chars). The identity token will then carry that value in its `nonce` claim.
+2. `POST https://auth.snapie.io/api/app-login/apple` (this is Snapie, not BASE) with
+   `{"client": "iot", "identityToken": "<JWT string from Apple>", "state": "<state>",
+     "name": {"firstName": "...", "lastName": "..."}}`.
+   `name` is only available the first time the user authorizes; send it when you have it. Do not
+   require it. Success: `{"status":"ok","token":"<snapie-token>"}`.
+3. Continue at step 5 of section 2: `POST /api/auth/snapie {token, state, verifier}` on BASE.
+Errors: 401 `invalid_credential` (bad token, wrong bundle id, or nonce does not match the state),
+400 `apple_not_enabled` (the server owner has not registered the app's bundle ID yet),
+400 `invalid_state`, 403 `account_disabled`, 429 slow down.
+Requirements: the app's bundle ID must be registered for the `iot` client on the Snapie server, and
+the app needs the Sign in with Apple capability. Apple user ids are per developer team, so the same
+person signing in with Apple here and in a different team's app are different accounts.
+If the user hides their email, nothing changes: this server never needs an email.
+
 The redirect scheme is fixed by the server (`APP_REDIRECT`, default `menoiot://auth`) and must also be
 registered on the Snapie side. If you change the app's URL scheme, the server owner must update both;
 otherwise login ends on a Snapie error page.
@@ -47,9 +67,8 @@ iOS
   WKWebView or SFSafariViewController. No Info.plist URL scheme entry is needed for this API.
 - Keep the session token in the Keychain.
 - App Store rule 4.8: an app that offers a third-party social login (Google) must also offer an
-  equivalent privacy-preserving option, i.e. Sign in with Apple. SIGN IN WITH APPLE IS NOT AVAILABLE
-  through this login flow today (the Snapie login page offers Google and email only). Treat it as a
-  required follow-up before App Store submission; see section 9. Do not fake it client-side.
+  equivalent privacy-preserving option, i.e. Sign in with Apple. Use the native flow in section 2b
+  (not the browser page, which offers Google and email only).
 - iOS suspends network sockets shortly after the app goes to the background; the MQTT connection will
   drop. Reconnect on foreground and reload state. There is no push notification support yet.
 - Trusted TLS certificates only (Let's Encrypt is fine). Self-signed certificates will fail.
@@ -129,8 +148,8 @@ room) -> pairing code screen; device detail (rename, move room, new pairing code
 - Do not poll REST for state; use MQTT.
 
 ## 9. Known gaps (do not pretend these exist)
-- Sign in with Apple: not offered by the login page used here. Needed for App Store review if Google
-  login is shown (see iOS notes). The server owner must add it on the Snapie side first.
+- Sign in with Apple: native flow in section 2b only; it works once the Snapie server has been updated
+  and the bundle ID registered. The browser login page offers Google and email only.
 - Push notifications for background alerts: not implemented (no APNs/FCM).
 - Telemetry history and charts: not implemented; only the latest state is available live.
 - Token refresh: none; sign in again after 7 days.
