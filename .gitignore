@@ -1,0 +1,8 @@
+node_modules/
+data/
+broker/certs/
+broker/broker-api-secret
+broker/mosquitto.conf
+vendor/
+web/vendor/
+.env

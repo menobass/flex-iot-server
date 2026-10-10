@@ -1,0 +1,229 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Flex IOT</title>
+<style>
+  :root { color-scheme: light dark; font: 15px system-ui, sans-serif; }
+  body { max-width: 760px; margin: 0 auto; padding: 1rem; }
+  .card { border: 1px solid #8884; border-radius: 8px; padding: .75rem 1rem; margin: .75rem 0; }
+  .row { display: flex; gap: .5rem; align-items: center; flex-wrap: wrap; }
+  .row > .grow { flex: 1; }
+  code { background: #8882; padding: 0 .3rem; border-radius: 4px; }
+  .code { font-size: 1.4rem; letter-spacing: .15rem; }
+  .on { color: #1a9a3a } .off { color: #888 }
+  .room h2 { margin: 1.25rem 0 .25rem; font-size: 1.1rem }
+  .err { color: #c0392b }
+  [hidden] { display: none !important }
+</style>
+<h1>Flex IOT</h1>
+
+<section id="login" class="card" hidden>
+  <p>Sign in to manage your devices.</p>
+  <button id="loginBtn">Sign in with Snapie</button>
+  <p id="loginErr"></p>
+</section>
+
+<section id="app" hidden>
+  <div class="row card">
+    <span class="grow">Signed in as <b id="who"></b> <small id="whoId"></small></span>
+    <button id="logout">Sign out</button>
+  </div>
+  <p id="appErr" class="err"></p>
+  <div class="card">
+    <h3>Rooms</h3>
+    <div class="row">
+      <input id="roomName" class="grow" placeholder="New room, e.g. Kitchen" maxlength="64">
+      <button id="addRoom">Add room</button>
+    </div>
+  </div>
+  <div class="card">
+    <h3>Add device</h3>
+    <div class="row">
+      <input id="name" class="grow" placeholder="Name, e.g. Desk lamp" maxlength="64">
+      <select id="type"></select>
+      <select id="room"></select>
+      <button id="add">Add</button>
+    </div>
+    <div id="pairing" hidden>
+      <p>Enter this code on the device (valid 10 min, single use):</p>
+      <div class="code"><code id="pairCode"></code></div>
+      <p>Device calls <code>POST <span id="pairUrl"></span></code> with <code>{"code":"…"}</code>.</p>
+    </div>
+  </div>
+  <div id="devices"></div>
+</section>
+
+<script src="/vendor/mqtt.min.js"></script>
+<script>
+const $ = (id) => document.getElementById(id);
+const api = async (method, path, body) => {
+  const r = await fetch('/api' + path, { method, headers: { 'content-type': 'application/json' },
+    body: method === 'GET' ? undefined : JSON.stringify(body ?? {}), credentials: 'same-origin' });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw Object.assign(new Error(data.error || r.status), { status: r.status });
+  return data;
+};
+let types = {}, devices = [], rooms = [], mqttClient = null;
+const state = {}, online = {};
+
+$('loginBtn').onclick = async () => {
+  $('loginErr').textContent = '';
+  try {
+    // PKCE: the verifier never leaves this tab, so a leaked redirect can't be redeemed elsewhere.
+    const verifier = btoa(String.fromCharCode(...crypto.getRandomValues(new Uint8Array(32)))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
+    const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(verifier)));
+    const challenge = btoa(String.fromCharCode(...digest)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
+    sessionStorage.setItem('login_verifier', verifier);
+    location.href = (await api('GET', '/auth/start?platform=web&challenge=' + challenge)).url;
+  }
+  catch (e) { $('loginErr').textContent = e.message; }
+};
+// Back from Snapie: /auth/callback#token=...&state=... (or #error=...)
+async function finishLogin() {
+  const p = new URLSearchParams(location.hash.slice(1));
+  history.replaceState(null, '', '/');
+  if (p.get('error') || !p.get('token')) throw new Error(p.get('error') || 'login_failed');
+  const verifier = sessionStorage.getItem('login_verifier');
+  sessionStorage.removeItem('login_verifier');
+  await api('POST', '/auth/snapie', { token: p.get('token'), state: p.get('state'), verifier });
+}
+$('logout').onclick = async () => { await api('POST', '/auth/logout'); mqttClient?.end(); location.reload(); };
+
+$('addRoom').onclick = async () => {
+  const name = $('roomName').value.trim();
+  if (!name) return;
+  await api('POST', '/rooms', { name });
+  $('roomName').value = '';
+  await load();
+};
+
+$('add').onclick = async () => {
+  const name = $('name').value.trim();
+  if (!name) return;
+  const d = await api('POST', '/devices', { name, type: $('type').value, room: $('room').value || null });
+  $('name').value = '';
+  showCode(d.pairing.code);
+  await load();
+};
+function showCode(code) {
+  $('pairCode').textContent = code;
+  $('pairUrl').textContent = location.origin + '/api/pair';
+  $('pairing').hidden = false;
+}
+
+function deviceCard(d) {
+  const el = document.createElement('div');
+  el.className = 'card';
+  const s = state[d.id] || {};
+  const isSwitch = types[d.type]?.category === 'switch';
+  el.innerHTML = `<div class="row"><b class="grow"></b><span class="${online[d.id] ? 'on' : 'off'}">${online[d.id] ? '● online' : '○ offline'}</span></div>
+    <div class="row"><span class="grow"><small></small></span><span class="val"></span></div><div class="row act"></div>`;
+  el.querySelector('b').textContent = `${d.name} (${types[d.type]?.name || d.type})`;
+  el.querySelector('small').textContent = d.paired ? d.topic : 'not paired yet';
+  el.querySelector('.val').textContent = isSwitch ? (s.on === undefined ? '' : s.on ? 'ON' : 'OFF')
+    : s.value !== undefined ? `${s.value} ${s.unit || ''}` : '';
+  const act = el.querySelector('.act');
+  const btn = (label, fn) => { const b = document.createElement('button'); b.textContent = label; b.onclick = guard(fn); act.append(b); };
+  if (isSwitch) btn('Toggle', () => mqttClient.publish(`${d.topic}/cmd`, JSON.stringify({ on: !s.on })));
+  btn(d.paired ? 'Re-pair' : 'New code', async () => showCode((await api('POST', `/devices/${d.id}/pairing-code`)).code));
+  btn('Delete', async () => { await api('DELETE', `/devices/${d.id}`); await load(); });
+  const sel = roomSelect(d.room);
+  sel.onchange = guard(async () => { await api('PATCH', `/devices/${d.id}`, { room: sel.value || null }); await load(); });
+  act.append(sel);
+  return el;
+}
+
+function roomSelect(current) {
+  const sel = document.createElement('select');
+  sel.append(new Option('No room', ''), ...rooms.map((r) => new Option(r.name, r.id)));
+  sel.value = current || '';
+  return sel;
+}
+
+// Run an async click handler; show any failure instead of silently doing nothing.
+const guard = (fn) => async (...a) => {
+  $('appErr').textContent = '';
+  try { await fn(...a); } catch (e) { $('appErr').textContent = 'Something went wrong: ' + e.message; }
+};
+
+function roomSection(room, list) {
+  const sec = document.createElement('div');
+  sec.className = 'room';
+  const head = document.createElement('div');
+  head.className = 'row';
+  head.innerHTML = '<h2 class="grow"></h2>';
+  head.querySelector('h2').textContent = room ? room.name : 'No room';
+  const switches = list.filter((d) => types[d.type]?.category === 'switch' && d.paired);
+  const add = (label, fn) => { const b = document.createElement('button'); b.textContent = label; b.onclick = guard(fn); head.append(b); };
+  // Room-wide control is just one command per device on its own topic.
+  const all = (on) => switches.forEach((d) => mqttClient.publish(`${d.topic}/cmd`, JSON.stringify({ on })));
+  if (switches.length) { add('All on', () => all(true)); add('All off', () => all(false)); }
+  if (room) {
+    add('Rename', async () => {
+      const name = prompt('Room name', room.name)?.trim();
+      if (name) { await api('PATCH', `/rooms/${room.id}`, { name }); await load(); }
+    });
+    add('Delete room', async () => {
+      if (confirm(`Delete room "${room.name}"? Its devices are kept.`)) { await api('DELETE', `/rooms/${room.id}`); await load(); }
+    });
+  }
+  sec.append(head, ...(list.length ? list.map(deviceCard) : [Object.assign(document.createElement('small'), { textContent: 'No devices here yet.' })]));
+  return sec;
+}
+
+function render() {
+  const sections = rooms.map((r) => roomSection(r, devices.filter((d) => d.room === r.id)));
+  const loose = devices.filter((d) => !rooms.some((r) => r.id === d.room));
+  if (loose.length || !rooms.length) sections.push(roomSection(null, loose));
+  $('devices').replaceChildren(...sections);
+  const cur = $('room').value;
+  $('room').replaceChildren(new Option('No room', ''), ...rooms.map((r) => new Option(r.name, r.id)));
+  $('room').value = rooms.some((r) => r.id === cur) ? cur : '';
+}
+
+async function load() {
+  [devices, rooms] = await Promise.all([api('GET', '/devices'), api('GET', '/rooms')]);
+  render();
+}
+
+async function connectMqtt() {
+  const t = await api('POST', '/mqtt-token');
+  mqttClient = mqtt.connect(t.url, { username: t.username, password: t.password, reconnectPeriod: 3000 });
+  mqttClient.on('connect', () => mqttClient.subscribe(t.topic));
+  mqttClient.on('close', () => { /* creds expire after 1h; reload to refresh */ });
+  mqttClient.on('message', (topic, payload) => {
+    const m = topic.match(/^u\/[^/]+\/d\/([a-z0-9]+)\/(state|status)$/);
+    if (!m) return;
+    const text = payload.toString();
+    if (m[2] === 'status') online[m[1]] = text === 'online';
+    else { try { state[m[1]] = JSON.parse(text); } catch {} online[m[1]] = true; }
+    render();
+  });
+}
+
+async function start() {
+  const me = await api('GET', '/me');
+  $('who').textContent = me.name || 'your account';
+  $('whoId').textContent = '· id ' + me.user.slice(-6);
+  $('login').hidden = true; $('app').hidden = false;
+  const list = await api('GET', '/types');
+  types = Object.fromEntries(list.map((t) => [t.key, t]));
+  $('type').replaceChildren(...list.map((t) => new Option(t.name, t.key)));
+  await load();
+  await connectMqtt();
+}
+
+(async () => {
+  try {
+    if (location.pathname === '/auth/callback') await finishLogin();
+    await start();
+  } catch (e) {
+    // Only a missing/expired session means "show the login". Anything else (e.g. the
+    // dashboard failing to load) must not look like being logged out.
+    if (e.status === 401 || $('app').hidden) {
+      $('app').hidden = true; $('login').hidden = false;
+      if (e.status !== 401) $('loginErr').textContent = 'Sign-in failed: ' + e.message;
+    } else $('appErr').textContent = 'Something went wrong: ' + e.message;
+  }
+})();
+</script>
