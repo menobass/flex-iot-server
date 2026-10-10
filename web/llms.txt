@@ -1,0 +1,136 @@
+# Flex IOT server: integration guide for AI assistants building a mobile app
+
+> Flex IOT lets a user register IoT devices (switches, sensors, ...), group them into rooms, pair them
+> with a one-time code, and see/control them live over MQTT. This file tells you how to build the
+> Android or iOS client for it. Follow it literally; do not invent endpoints.
+
+BASE = the server URL you were given, e.g. https://iot.example.com (always https). All paths below are
+relative to BASE. All bodies and responses are JSON. Users never see or need to know about Hive or
+blockchain: they sign in with Google or email through "Snapie" and that is all.
+
+## 1. Architecture in one minute
+- REST API under BASE/api for accounts, devices, rooms, pairing.
+- MQTT broker for live data. The app connects with MQTT over secure WebSocket (wss) using short-lived
+  credentials from the API. The app only reads its own topics and only publishes commands.
+- Physical devices pair separately (section 6) and publish state; the app never sees their passwords.
+
+## 2. Sign in (do this exactly)
+Login uses Snapie's web login page in the system browser plus PKCE. The app never handles passwords.
+
+1. Generate `verifier`: 43 to 128 chars from [A-Za-z0-9_-] (32 random bytes, base64url, no padding).
+   Keep it in memory (or secure storage) until step 5.
+2. `challenge = base64url_no_padding(SHA256(verifier))` (always 43 chars).
+3. `GET /api/auth/start?platform=app&challenge=<challenge>` -> `{"state": "...", "url": "https://.../login?..."}`.
+4. Open `url` in the system auth browser (see platform notes). The user signs in there. When done the
+   browser navigates to the app's registered redirect:
+   `<app-scheme>://auth?token=<snapie-token>&state=<state>`  or on failure  `...?error=<code>&state=<state>`.
+   Check that `state` equals the one from step 3 before continuing.
+5. Immediately (the token lives 120 seconds): `POST /api/auth/snapie` with
+   `{"token": "<snapie-token>", "state": "<state>", "verifier": "<verifier>"}`
+   -> `{"token": "<session>", "user": "<user id>", "name": "<display name or null>", "admin": false}`.
+   `state` is single use: if this call fails, restart from step 1.
+6. Store `token` in secure storage (iOS Keychain / Android Keystore-backed storage). Send it on every
+   API call as `Authorization: Bearer <session>`. It is valid 7 days; there is no refresh: on any 401
+   run the sign-in again.
+7. Sign out: `POST /api/auth/logout` (Bearer, body `{}`), then delete the stored token.
+
+`GET /api/me` (Bearer) -> `{"user", "name", "admin"}`. Show `name` in the UI so users can see who they
+are signed in as. There is no email available; do not ask Snapie for one.
+
+The redirect scheme is fixed by the server (`APP_REDIRECT`, default `menoiot://auth`) and must also be
+registered on the Snapie side. If you change the app's URL scheme, the server owner must update both;
+otherwise login ends on a Snapie error page.
+
+## 3. Platform differences (read this)
+iOS
+- Use `ASWebAuthenticationSession` with `callbackURLScheme` = the scheme (e.g. `menoiot`). Do NOT use
+  WKWebView or SFSafariViewController. No Info.plist URL scheme entry is needed for this API.
+- Keep the session token in the Keychain.
+- App Store rule 4.8: an app that offers a third-party social login (Google) must also offer an
+  equivalent privacy-preserving option, i.e. Sign in with Apple. SIGN IN WITH APPLE IS NOT AVAILABLE
+  through this login flow today (the Snapie login page offers Google and email only). Treat it as a
+  required follow-up before App Store submission; see section 9. Do not fake it client-side.
+- iOS suspends network sockets shortly after the app goes to the background; the MQTT connection will
+  drop. Reconnect on foreground and reload state. There is no push notification support yet.
+- Trusted TLS certificates only (Let's Encrypt is fine). Self-signed certificates will fail.
+
+Android
+- Use Chrome Custom Tabs (`androidx.browser`) or AppAuth / `flutter_web_auth_2`. Do NOT use an embedded
+  WebView: Google refuses sign-in inside WebViews.
+- Declare the redirect as an intent filter on the receiving activity: action VIEW, categories DEFAULT
+  and BROWSABLE, `<data android:scheme="menoiot" android:host="auth"/>`. Use `launchMode="singleTask"`
+  so the result returns to the running activity.
+- Keep the session token in EncryptedSharedPreferences / Keystore.
+- Doze and background limits stop idle sockets; reconnect when the app returns to the foreground.
+  Real-time background alerts would need FCM, which this server does not provide yet.
+- Cleartext HTTP is blocked by default; everything here is https/wss so no network config is needed.
+
+Both: other apps can claim the same custom scheme. PKCE (step 2) is what makes a hijacked redirect
+useless, so never skip the verifier.
+
+## 4. REST API (all except /api/auth/*, /api/pair need Bearer)
+Content-Type must be application/json on any POST/PATCH/PUT, even with an empty body (send `{}`).
+Errors are `{"error": "<code>"}`: 400 invalid_*/bad_request, 401 unauthorized, 403 admin_required,
+404 not_found, 415 json_required, 429 rate limited (back off and retry).
+
+GET  /api/me
+GET  /api/types -> [{key, name, category, schema}]   device types; schema = {state:{...}, cmd:{...}}
+GET  /api/rooms -> [{id, name}]
+POST /api/rooms {name} -> {id, name}                 name 1-64 chars, max 50 rooms per user
+PATCH /api/rooms/:id {name}
+DELETE /api/rooms/:id                                devices in it are kept, just unassigned
+GET  /api/devices -> [{id, name, type, room, paired, created, topic}]   room = room id or null
+POST /api/devices {name, type, room?} -> {id, name, type, room, topic, pairing:{code, expiresIn}}
+PATCH /api/devices/:id {name?, room?}                room:null removes it from its room
+DELETE /api/devices/:id                              also revokes the device's credentials
+POST /api/devices/:id/pairing-code -> {code, expiresIn}   new one-time code (invalidates the old one)
+POST /api/mqtt-token {} -> {url, username, password, topic, expiresIn}
+
+Build the device-type picker from GET /api/types (the list changes without app updates). Render by
+`category`: `switch` -> toggle, `sensor` -> value + unit. For an unknown category show the raw state
+JSON; never crash.
+
+## 5. Live data over MQTT
+1. `POST /api/mqtt-token` -> `{url: "wss://host/mqtt", username, password, topic: "u/<user>/#", expiresIn: 3600}`.
+2. Connect an MQTT 3.1.1 client over WebSocket to `url` with that username/password. Use a unique
+   clientId. Subscribe to `topic`.
+3. Credentials last `expiresIn` seconds (1 hour). Before that, fetch a new token and reconnect;
+   after expiry the broker denies everything. Never cache the password to disk.
+
+Topics (every device has `topic` from the REST API, call it T = `u/<user>/d/<device_id>`):
+- `T/state`  JSON from the device, shaped by its type schema, e.g. switch `{"on":true}`, sensor
+  `{"value":21.5,"unit":"C"}`. Treat fields as optional.
+- `T/status` plain text `online` or `offline`.
+- `T/cmd`    the ONLY topic the app may publish to. JSON per the type's `cmd` schema, e.g.
+  `{"on":true}`. Publish with QoS 0 or 1, retain = false.
+The ACL denies anything else, including other users' topics. There is no wildcard publish.
+
+Rooms are only labels in the API. They are not in topic names, so moving a device between rooms
+never changes its topic. For "all lights off" in a room, publish one `cmd` per device in it.
+
+## 6. Adding a device from the app
+1. `POST /api/devices {name, type, room?}` -> read `pairing.code` (8 chars, valid 10 minutes, single
+   use). Show it to the user or hand it to the device (BLE / Wi-Fi provisioning).
+2. The DEVICE (not the app) calls `POST /api/pair {"code": "ABCD2345"}` (no auth, rate limited) and gets
+   `{host, port, tls, username, password, clientId, publish:{state,status}, subscribe:{cmd}}`, then
+   connects to the broker over TLS on `port` and uses exactly those topics.
+3. The device appears with `paired: true` in `GET /api/devices` and `online` once it connects.
+Re-pairing (new code) replaces the device password; the old password stops working for new connections.
+
+## 7. Suggested screens
+Sign in; device list grouped by room (name, online badge, value, toggle); add device (name, type,
+room) -> pairing code screen; device detail (rename, move room, new pairing code, delete); settings
+(signed-in name, sign out). Reload `GET /api/devices` after any change; apply live changes from MQTT.
+
+## 8. Do not
+- Do not embed API keys or the broker secret; there are none for clients.
+- Do not call endpoints starting with `/broker/`; they are internal.
+- Do not store the Snapie token or verifier after step 5; keep only the session token.
+- Do not poll REST for state; use MQTT.
+
+## 9. Known gaps (do not pretend these exist)
+- Sign in with Apple: not offered by the login page used here. Needed for App Store review if Google
+  login is shown (see iOS notes). The server owner must add it on the Snapie side first.
+- Push notifications for background alerts: not implemented (no APNs/FCM).
+- Telemetry history and charts: not implemented; only the latest state is available live.
+- Token refresh: none; sign in again after 7 days.
