@@ -57,6 +57,28 @@ the app needs the Sign in with Apple capability. Apple user ids are per develope
 person signing in with Apple here and in a different team's app are different accounts.
 If the user hides their email, nothing changes: this server never needs an email.
 
+## 2c. Google sign-in without a browser (Android and iOS, native)
+Prefer this over the browser sheet for Google users. Same PKCE steps 1 to 3 from section 2 (call
+/api/auth/start, keep `state` and `verifier`, ignore the returned `url`), then:
+1. Get a Google ID token with the platform SDK, passing the server/web OAuth client ID you were given
+   (call it GOOGLE_WEB_CLIENT_ID) and `nonce = lowercase_hex(SHA256(state))` (64 hex chars):
+   - Android: Credential Manager, `GetGoogleIdOption.Builder().setServerClientId(GOOGLE_WEB_CLIENT_ID)
+     .setNonce(nonce)`; read `GoogleIdTokenCredential.idToken`.
+   - iOS: Google Sign-In SDK, `serverClientID = GOOGLE_WEB_CLIENT_ID`, pass the nonce to
+     `signIn(withPresenting:hint:additionalScopes:nonce:)`; read `user.idToken.tokenString`.
+2. `POST https://auth.snapie.io/api/app-login/google` (Snapie, not BASE) with
+   `{"client": "iot", "idToken": "<Google ID token>", "state": "<state>"}`.
+   Success: `{"status":"ok","token":"<snapie-token>"}`.
+3. Continue at step 5 of section 2: `POST /api/auth/snapie {token, state, verifier}` on BASE.
+Errors: 401 `invalid_credential` (bad token, wrong client id, or nonce does not match the state),
+400 `google_not_enabled` (the server owner has not registered the OAuth client id yet),
+400 `invalid_state`, 403 `account_disabled`, 429 slow down.
+The OAuth client ID used as audience must be registered for the `iot` client on the Snapie server. A person
+who signs in with Google here is the same user as on the web. The Android/iOS OAuth clients themselves
+(package name + SHA-1, bundle id) are created in the Google Cloud console by the app owner.
+Native Google or Apple sign-in need no browser; the system browser sheet (section 2) remains for email
+accounts.
+
 The redirect scheme is fixed by the server (`APP_REDIRECT`, default `menoiot://auth`) and must also be
 registered on the Snapie side. If you change the app's URL scheme, the server owner must update both;
 otherwise login ends on a Snapie error page.
