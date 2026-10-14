@@ -10,6 +10,9 @@ const PAIR_TTL = 600;
 const WEB_CRED_TTL = 3600;
 const CODE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // no 0/O/1/I
 
+// Snapie user ids go straight into MQTT topics and the broker ACL, so keep them
+// to a safe charset and a bounded length (the firmware stores topics in fixed buffers).
+const USER_ID = /^[A-Za-z0-9_-]{1,32}$/;
 const B64URL = /^[A-Za-z0-9_-]+$/;
 const pkce = (verifier) => createHash('sha256').update(verifier).digest('base64url');
 const newCode = () => Array.from({ length: 8 }, () => CODE_ALPHABET[randomInt(CODE_ALPHABET.length)]).join('');
@@ -72,7 +75,7 @@ export async function buildApi({ db, verify, cfg }) {
     if (pkce(verifier) !== row.challenge) return reply.code(401).send({ error: 'invalid_verifier' });
     let claims;
     try { claims = await verify(snapieToken); } catch { return reply.code(401).send({ error: 'invalid_token' }); }
-    if (claims.nonce !== state || typeof claims.sub !== 'string') return reply.code(401).send({ error: 'invalid_token' });
+    if (claims.nonce !== state || typeof claims.sub !== 'string' || !USER_ID.test(claims.sub)) return reply.code(401).send({ error: 'invalid_token' });
     const name = typeof claims.name === 'string' ? claims.name.slice(0, 64) : null;
     db.prepare(`INSERT INTO users (user_id, name, created) VALUES (?,?,?)
       ON CONFLICT(user_id) DO UPDATE SET name=excluded.name`).run(claims.sub, name, now());

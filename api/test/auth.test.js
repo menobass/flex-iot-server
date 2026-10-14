@@ -119,3 +119,28 @@ test('broker API only answers under the secret path', async () => {
   assert.equal((await app.inject({ method: 'POST', url: '/broker/wrongsecret/user', payload: body })).statusCode, 404);
   assert.equal((await app.inject({ method: 'POST', url: `/broker/${secret}/user`, payload: body })).statusCode, 401);
 });
+
+test('rejects user ids that are unsafe in a topic or too long for the device', async () => {
+  const { post, start } = await setup();
+  for (const sub of ['a/b', 'a+b', 'a#', 'a.b', 'x'.repeat(33), '']) {
+    const { state, verifier } = await start();
+    const r = await post('/api/auth/snapie', { token: await mint({ nonce: state }, { sub: sub || ' ' }), state, verifier });
+    assert.equal(r.statusCode, 401, `sub ${JSON.stringify(sub)}`);
+  }
+});
+
+test('pairing response fits the firmware field limits', async () => {
+  const { app, db, post, start } = await setup();
+  db.prepare("INSERT INTO device_types (key,name,category,schema,active) VALUES ('t','T','c','{}',1)").run();
+  const sub = 'u'.repeat(32); // longest accepted id
+  const { state, verifier } = await start();
+  const login = (await post('/api/auth/snapie', { token: await mint({ nonce: state }, { sub }), state, verifier })).json();
+  const dev = await app.inject({ method: 'POST', url: '/api/devices', headers: { authorization: `Bearer ${login.token}` },
+    payload: { name: 'Fan', type: 't' } });
+  assert.equal(dev.statusCode, 200, dev.body);
+  const paired = (await post('/api/pair', { code: dev.json().pairing.code })).json();
+  const len = (v) => v.length + 1; // with the device's NUL terminator
+  assert.ok(len(paired.clientId) <= 16 && len(paired.username) <= 16, 'client id / username');
+  assert.ok(len(paired.password) <= 40, 'password');
+  for (const t of [paired.publish.state, paired.publish.status, paired.subscribe.cmd]) assert.ok(len(t) <= 64, `topic ${t}`);
+});
